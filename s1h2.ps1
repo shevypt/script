@@ -2802,7 +2802,6 @@ function Get-DomainObjectAcl {
         }
     }
 }
-
 $Mod = New-InMemoryModule -ModuleName Win32
 
 # [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPositionalParameters', Scope='Function', Target='psenum')]
@@ -3076,3 +3075,280 @@ Set-Alias Find-ForeignUser Get-DomainForeignUser
 Set-Alias Find-ForeignGroup Get-DomainForeignGroupMember
 Set-Alias Invoke-MapDomainTrust Get-DomainTrustMapping
 Set-Alias Get-DomainPolicy Get-DomainPolicyData
+
+
+function Get-DomainGUIDMap {
+
+
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '')]
+    [OutputType([Hashtable])]
+    [CmdletBinding()]
+    Param (
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Domain,
+
+        [ValidateNotNullOrEmpty()]
+        [Alias('DomainController')]
+        [String]
+        $Server,
+
+        [ValidateRange(1, 10000)]
+        [Int]
+        $ResultPageSize = 200,
+
+        [ValidateRange(1, 10000)]
+        [Int]
+        $ServerTimeLimit,
+
+        [Management.Automation.PSCredential]
+        [Management.Automation.CredentialAttribute()]
+        $Credential = [Management.Automation.PSCredential]::Empty
+    )
+
+    $GUIDs = @{'00000000-0000-0000-0000-000000000000' = 'All'}
+
+    $ForestArguments = @{}
+    if ($PSBoundParameters['Credential']) { $ForestArguments['Credential'] = $Credential }
+
+    try {
+        $SchemaPath = (Get-Forest @ForestArguments).schema.name
+    }
+    catch {
+        throw '[Get-DomainGUIDMap] Error in retrieving forest schema path from Get-Forest'
+    }
+    if (-not $SchemaPath) {
+        throw '[Get-DomainGUIDMap] Error in retrieving forest schema path from Get-Forest'
+    }
+
+    $SearcherArguments = @{
+        'SearchBase' = $SchemaPath
+        'LDAPFilter' = '(schemaIDGUID=*)'
+    }
+    if ($PSBoundParameters['Domain']) { $SearcherArguments['Domain'] = $Domain }
+    if ($PSBoundParameters['Server']) { $SearcherArguments['Server'] = $Server }
+    if ($PSBoundParameters['ResultPageSize']) { $SearcherArguments['ResultPageSize'] = $ResultPageSize }
+    if ($PSBoundParameters['ServerTimeLimit']) { $SearcherArguments['ServerTimeLimit'] = $ServerTimeLimit }
+    if ($PSBoundParameters['Credential']) { $SearcherArguments['Credential'] = $Credential }
+    $SchemaSearcher = Get-DomainSearcher @SearcherArguments
+
+    if ($SchemaSearcher) {
+        try {
+            $Results = $SchemaSearcher.FindAll()
+            $Results | Where-Object {$_} | ForEach-Object {
+                $GUIDs[(New-Object Guid (,$_.properties.schemaidguid[0])).Guid] = $_.properties.name[0]
+            }
+            if ($Results) {
+                try { $Results.dispose() }
+                catch {
+                    Write-Verbose "[Get-DomainGUIDMap] Error disposing of the Results object: $_"
+                }
+            }
+            $SchemaSearcher.dispose()
+        }
+        catch {
+            Write-Verbose "[Get-DomainGUIDMap] Error in building GUID map: $_"
+        }
+    }
+
+    $SearcherArguments['SearchBase'] = $SchemaPath.replace('Schema','Extended-Rights')
+    $SearcherArguments['LDAPFilter'] = '(objectClass=controlAccessRight)'
+    $RightsSearcher = Get-DomainSearcher @SearcherArguments
+
+    if ($RightsSearcher) {
+        try {
+            $Results = $RightsSearcher.FindAll()
+            $Results | Where-Object {$_} | ForEach-Object {
+                $GUIDs[$_.properties.rightsguid[0].toString()] = $_.properties.name[0]
+            }
+            if ($Results) {
+                try { $Results.dispose() }
+                catch {
+                    Write-Verbose "[Get-DomainGUIDMap] Error disposing of the Results object: $_"
+                }
+            }
+            $RightsSearcher.dispose()
+        }
+        catch {
+            Write-Verbose "[Get-DomainGUIDMap] Error in building GUID map: $_"
+        }
+    }
+
+    $GUIDs
+}
+
+function Get-Forest {
+
+
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '')]
+    [OutputType('System.Management.Automation.PSCustomObject')]
+    [CmdletBinding()]
+    Param(
+        [Parameter(Position = 0, ValueFromPipeline = $True)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Forest,
+
+        [Management.Automation.PSCredential]
+        [Management.Automation.CredentialAttribute()]
+        $Credential = [Management.Automation.PSCredential]::Empty
+    )
+
+    PROCESS {
+        if ($PSBoundParameters['Credential']) {
+
+            Write-Verbose "[Get-Forest] Using alternate credentials for Get-Forest"
+
+            if ($PSBoundParameters['Forest']) {
+                $TargetForest = $Forest
+            }
+            else {
+                # if no domain is supplied, extract the logon domain from the PSCredential passed
+                $TargetForest = $Credential.GetNetworkCredential().Domain
+                Write-Verbose "[Get-Forest] Extracted domain '$Forest' from -Credential"
+            }
+
+            $ForestContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Forest', $TargetForest, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+
+            try {
+                $ForestObject = [System.DirectoryServices.ActiveDirectory.Forest]::GetForest($ForestContext)
+            }
+            catch {
+                Write-Verbose "[Get-Forest] The specified forest '$TargetForest' does not exist, could not be contacted, there isn't an existing trust, or the specified credentials are invalid: $_"
+                $Null
+            }
+        }
+        elseif ($PSBoundParameters['Forest']) {
+            $ForestContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Forest', $Forest)
+            try {
+                $ForestObject = [System.DirectoryServices.ActiveDirectory.Forest]::GetForest($ForestContext)
+            }
+            catch {
+                Write-Verbose "[Get-Forest] The specified forest '$Forest' does not exist, could not be contacted, or there isn't an existing trust: $_"
+                return $Null
+            }
+        }
+        else {
+            # otherwise use the current forest
+            $ForestObject = [System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest()
+        }
+
+        if ($ForestObject) {
+            # get the SID of the forest root
+            if ($PSBoundParameters['Credential']) {
+                $ForestSid = (Get-DomainUser -Identity "krbtgt" -Domain $ForestObject.RootDomain.Name -Credential $Credential).objectsid
+            }
+            else {
+                $ForestSid = (Get-DomainUser -Identity "krbtgt" -Domain $ForestObject.RootDomain.Name).objectsid
+            }
+
+            $Parts = $ForestSid -Split '-'
+            $ForestSid = $Parts[0..$($Parts.length-2)] -join '-'
+            $ForestObject | Add-Member NoteProperty 'RootDomainSid' $ForestSid
+            $ForestObject
+        }
+    }
+}
+
+
+function Get-ForestDomain {
+
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '')]
+    [OutputType('System.DirectoryServices.ActiveDirectory.Domain')]
+    [CmdletBinding()]
+    Param(
+        [Parameter(Position = 0, ValueFromPipeline = $True)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Forest,
+
+        [Management.Automation.PSCredential]
+        [Management.Automation.CredentialAttribute()]
+        $Credential = [Management.Automation.PSCredential]::Empty
+    )
+
+    PROCESS {
+        $Arguments = @{}
+        if ($PSBoundParameters['Forest']) { $Arguments['Forest'] = $Forest }
+        if ($PSBoundParameters['Credential']) { $Arguments['Credential'] = $Credential }
+
+        $ForestObject = Get-Forest @Arguments
+        if ($ForestObject) {
+            $ForestObject.Domains
+        }
+    }
+}
+
+
+function Get-ForestGlobalCatalog {
+
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '')]
+    [OutputType('System.DirectoryServices.ActiveDirectory.GlobalCatalog')]
+    [CmdletBinding()]
+    Param(
+        [Parameter(Position = 0, ValueFromPipeline = $True)]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Forest,
+
+        [Management.Automation.PSCredential]
+        [Management.Automation.CredentialAttribute()]
+        $Credential = [Management.Automation.PSCredential]::Empty
+    )
+
+    PROCESS {
+        $Arguments = @{}
+        if ($PSBoundParameters['Forest']) { $Arguments['Forest'] = $Forest }
+        if ($PSBoundParameters['Credential']) { $Arguments['Credential'] = $Credential }
+
+        $ForestObject = Get-Forest @Arguments
+
+        if ($ForestObject) {
+            $ForestObject.FindAllGlobalCatalogs()
+        }
+    }
+}
+
+
+function Get-ForestSchemaClass {
+
+
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '')]
+    [OutputType([System.DirectoryServices.ActiveDirectory.ActiveDirectorySchemaClass])]
+    [CmdletBinding()]
+    Param(
+        [Parameter(Position = 0, ValueFromPipeline = $True)]
+        [Alias('Class')]
+        [ValidateNotNullOrEmpty()]
+        [String[]]
+        $ClassName,
+
+        [Alias('Name')]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $Forest,
+
+        [Management.Automation.PSCredential]
+        [Management.Automation.CredentialAttribute()]
+        $Credential = [Management.Automation.PSCredential]::Empty
+    )
+
+    PROCESS {
+        $Arguments = @{}
+        if ($PSBoundParameters['Forest']) { $Arguments['Forest'] = $Forest }
+        if ($PSBoundParameters['Credential']) { $Arguments['Credential'] = $Credential }
+
+        $ForestObject = Get-Forest @Arguments
+
+        if ($ForestObject) {
+            if ($PSBoundParameters['ClassName']) {
+                ForEach ($TargetClass in $ClassName) {
+                    $ForestObject.Schema.FindClass($TargetClass)
+                }
+            }
+            else {
+                $ForestObject.Schema.FindAllClasses()
+            }
+        }
+    }
+}
